@@ -1,0 +1,329 @@
+/*************************************************************
+ *  FORECAST GENERATOR (ESP32 SENSOR DATA)
+ *************************************************************/
+function generateForecasts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Input and output sheet names
+  const INPUT_SHEET = "Sheet1";
+  const OUTPUT_SHEET = "Forecasts";
+
+  // Number of hours to forecast ahead
+  const HOURS_AHEAD = 24;
+
+  // Conversion factor from hPa to atm
+  const PRESSURE_HPA_TO_ATM = 1 / 1013.25;
+
+  // Input sheet headers
+  const inputHeaders = [
+    "Timestamp",
+    "Distance (cm)",
+    "Temperature (°C)",
+    "Humidity (%)",
+    "Pressure (atm)"
+  ];
+
+  // Output sheet headers
+  const outputHeaders = [
+    "Timestamp",
+    "Distance Forecast (cm)", "Distance Upper (cm)", "Distance Lower (cm)",
+    "Temperature Forecast (°C)", "Temperature Upper (°C)", "Temperature Lower (°C)",
+    "Humidity Forecast (%)", "Humidity Upper (%)", "Humidity Lower (%)",
+    "Pressure Forecast (atm)", "Pressure Upper (atm)", "Pressure Lower (atm)"
+  ];
+
+  // Create sheets if they do not exist
+  const inputSheet = getOrCreateSheet(ss, INPUT_SHEET, inputHeaders);
+  const forecastSheet = getOrCreateSheet(ss, OUTPUT_SHEET, outputHeaders);
+
+  // Ensure enough data exists
+  const lastRow = inputSheet.getLastRow();
+  if (lastRow < 3) throw new Error("Not enough ESP32 sensor data.");
+
+  // Read sensor data
+  const data = inputSheet.getRange(2, 1, lastRow - 1, 5).getValues();
+  const timestamps = data.map(r => r[0]);
+
+  // Separate sensor values
+  const sensors = {
+    Distance: data.map(r => parseNumber(r[1])),
+    Temperature: data.map(r => parseNumber(r[2])),
+    Humidity: data.map(r => parseNumber(r[3])),
+    Pressure: data.map(r => parseNumber(r[4]) * PRESSURE_HPA_TO_ATM)
+  };
+
+  // Generate forecasts for each sensor
+  const forecasts = {
+    Distance: forecast(sensors.Distance, timestamps, HOURS_AHEAD),
+    Temperature: forecast(sensors.Temperature, timestamps, HOURS_AHEAD),
+    Humidity: forecast(sensors.Humidity, timestamps, HOURS_AHEAD),
+    Pressure: forecast(sensors.Pressure, timestamps, HOURS_AHEAD)
+  };
+
+  // Clear previous forecast results
+  clearSheetContent(forecastSheet, outputHeaders.length);
+
+  // Prepare output rows
+  const output = [];
+  for (let i = 0; i < HOURS_AHEAD; i++) {
+    output.push([
+      forecasts.Distance[i].timestamp,
+      forecasts.Distance[i].value, forecasts.Distance[i].upper, forecasts.Distance[i].lower,
+      forecasts.Temperature[i].value, forecasts.Temperature[i].upper, forecasts.Temperature[i].lower,
+      forecasts.Humidity[i].value, forecasts.Humidity[i].upper, forecasts.Humidity[i].lower,
+      forecasts.Pressure[i].value, forecasts.Pressure[i].upper, forecasts.Pressure[i].lower
+    ]);
+  }
+
+  // Write forecast data to sheet
+  forecastSheet.getRange(2, 1, output.length, outputHeaders.length).setValues(output);
+  SpreadsheetApp.getUi().alert("Forecasts generated successfully!");
+}
+
+/*************************************************************
+ *  AI SUMMARY (OVERALL FORECAST ANALYSIS)
+ *************************************************************/
+function generateAISummary() {
+
+  // Retrieve Gemini API key from Script Properties
+  const API_KEY = PropertiesService
+    .getScriptProperties()
+    .getProperty("GEMINI_API_KEY");
+
+  // Stop execution if API key is missing
+  if (!API_KEY) {
+    throw new Error("Gemini API key not found in Script Properties.");
+  }
+
+  // AI model used for text analysis
+  const MODEL = "gemini-2.5-flash";
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const forecastSheet = ss.getSheetByName("Forecasts");
+
+  // Ensure forecast sheet exists
+  if (!forecastSheet) throw new Error("Forecasts sheet not found.");
+
+  const lastRow = forecastSheet.getLastRow();
+  if (lastRow < 3) throw new Error("No forecast data available.");
+
+  // Read up to 24 hours of forecast data
+  const data = forecastSheet
+    .getRange(2, 1, Math.min(24, lastRow - 1), forecastSheet.getLastColumn())
+    .getValues();
+
+  // Convert numerical data into readable text for AI processing
+  let forecastText = "24-hour ESP32 sensor forecast:\n";
+  data.forEach(r => {
+    forecastText += `
+Time: ${r[0]}
+Distance: ${r[1]} cm
+Temperature: ${r[4]} °C
+Humidity: ${r[7]} %
+Pressure: ${r[10]} atm
+`;
+  });
+
+  // Prompt instructs AI on how to analyze the data
+  const prompt = `
+Analyze the forecast data and provide:
+- Overall trends
+- Any potential risks or unusual changes
+- Simple recommendations
+Keep the explanation short, clear, and non-technical.
+${forecastText}
+`;
+
+  // Send request to Gemini API
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+
+  const response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    })
+  });
+
+  // Parse AI response
+  const json = JSON.parse(response.getContentText());
+
+  // Safely extract AI-generated summary
+  const aiSummary =
+    json.candidates?.[0]?.content?.parts?.[0]?.text ||
+    "AI summary could not be generated.";
+
+  // Write AI summary to a dedicated sheet
+  let summarySheet = ss.getSheetByName("AI_Summary");
+  if (!summarySheet) summarySheet = ss.insertSheet("AI_Summary");
+
+  summarySheet.clear();
+  summarySheet.getRange("A1").setValue("AI Forecast Summary");
+  summarySheet.getRange("A2").setValue(aiSummary);
+  summarySheet.setColumnWidth(1, 800);
+
+  SpreadsheetApp.getUi().alert("AI summary generated successfully!");
+}
+
+/*************************************************************
+ *  AI SUMMARY BY SENSOR (SEPARATED ANALYSIS)
+ *************************************************************/
+function generateAISummaryBySensor() {
+
+  // Retrieve Gemini API key
+  const API_KEY = PropertiesService
+    .getScriptProperties()
+    .getProperty("GEMINI_API_KEY");
+
+  if (!API_KEY) throw new Error("Gemini API key not found.");
+
+  const MODEL = "gemini-2.5-flash";
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const forecastSheet = ss.getSheetByName("Forecasts");
+
+  // Ensure forecast sheet exists
+  if (!forecastSheet) throw new Error("Forecasts sheet not found.");
+
+  const lastRow = forecastSheet.getLastRow();
+  if (lastRow < 3) throw new Error("No forecast data available.");
+
+  // Read forecast data
+  const data = forecastSheet
+    .getRange(2, 1, Math.min(24, lastRow - 1), forecastSheet.getLastColumn())
+    .getValues();
+
+  // Sensor configuration
+  const sensors = [
+    { name: "Temperature", index: 4, unit: "°C" },
+    { name: "Humidity", index: 7, unit: "%" },
+    { name: "Distance", index: 1, unit: "cm" },
+    { name: "Pressure", index: 10, unit: "atm" }
+  ];
+
+  // Prepare output sheet
+  let sheet = ss.getSheetByName("AI_Summary_By_Sensor");
+  if (!sheet) sheet = ss.insertSheet("AI_Summary_By_Sensor");
+
+  sheet.clear();
+  sheet.appendRow(["Sensor", "AI Summary"]);
+
+  // Generate AI summary for each sensor separately
+  sensors.forEach(s => {
+
+    // Build sensor-specific forecast text
+    const text = data
+      .map(r => `Time: ${r[0]}, Value: ${r[s.index]} ${s.unit}`)
+      .join("\n");
+
+    // Prompt focuses only on one sensor
+    const prompt = `
+Analyze the following ${s.name} forecast data.
+Provide:
+- Overall trend
+- Any unusual change or risk
+- Simple recommendation
+Use short and student-friendly language.
+
+${text}
+`;
+
+    // Call Gemini API
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+
+    const response = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }]
+      })
+    });
+
+    // Parse AI response
+    const json = JSON.parse(response.getContentText());
+    const aiText =
+      json.candidates?.[0]?.content?.parts?.[0]?.text ||
+      "Summary not available.";
+
+    // Write one row per sensor
+    sheet.appendRow([s.name, aiText]);
+  });
+
+  sheet.setColumnWidth(1, 160);
+  sheet.setColumnWidth(2, 800);
+
+  SpreadsheetApp.getUi().alert("AI summary by sensor generated successfully!");
+}
+
+/*************************************************************
+ *  FORECAST LOGIC
+ *************************************************************/
+function forecast(values, timestamps, hoursAhead) {
+  const valid = values
+    .map((v, i) => ({ v, t: timestamps[i] }))
+    .filter(d => !isNaN(d.v) && d.t instanceof Date);
+
+  if (valid.length < 3) throw new Error("Not enough valid data.");
+
+  // Simple Moving Average of last 6 readings
+  const sma = average(valid.slice(-6).map(d => d.v));
+  const lastTime = valid[valid.length - 1].t;
+  const result = [];
+
+  for (let i = 1; i <= hoursAhead; i++) {
+    const value = sma + randomVariation(sma);
+    result.push({
+      timestamp: new Date(lastTime.getTime() + i * 3600000),
+      value: round3(value),
+      upper: round3(value * 1.01),
+      lower: round3(value * 0.99)
+    });
+  }
+  return result;
+}
+
+/*************************************************************
+ *  HELPERS
+ *************************************************************/
+function getOrCreateSheet(ss, name, headers) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headers);
+  }
+  return sheet;
+}
+
+function clearSheetContent(sheet, cols) {
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow(), cols).clearContent();
+  }
+}
+
+function parseNumber(v) {
+  if (v === null || v === "") return NaN;
+  return parseFloat(String(v).replace(",", "."));
+}
+
+function average(arr) {
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function round3(num) {
+  return Math.round(num * 1000) / 1000;
+}
+
+function randomVariation(base) {
+  return (Math.random() - 0.5) * Math.max(base * 0.005, 0.01);
+}
+
+/*************************************************************
+ *  MENU
+ *************************************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Sensor Tools")
+    .addItem("Generate Forecasts", "generateForecasts")
+    .addItem("Generate AI Summary", "generateAISummary")
+    .addItem("Generate AI Summary (By Sensor)", "generateAISummaryBySensor")
+    .addToUi();
+}
